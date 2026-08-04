@@ -47,12 +47,17 @@ func (d *Deduplicator) ShouldEmit(event Event) bool {
 		return false
 	}
 
+	// An event tagged with an epoch older than the current handoff epoch is a
+	// re-emission from a stale shard assignment; it must not be deduplicated
+	// against — nor suppressed by — the current epoch's cache. And when the
+	// cache's entry belongs to an older epoch, it describes an outdated shard
+	// assignment and must not suppress this event either. Only entries from the
+	// same epoch participate in deduplication.
+	if event.Epoch != 0 && event.Epoch < d.epoch {
+		return true
+	}
+
 	// Deduplicate only against versions emitted under the SAME lease epoch.
-	// After a handoff bumps d.epoch, entries cached under an older epoch
-	// describe an outdated shard assignment — treating them as authoritative
-	// would let a stale version of a key shadow a new emission (the cache
-	// key collision this fix targets). Old-epoch entries therefore never
-	// suppress new-epoch events.
 	if ev, ok := d.emitted[event.Key]; ok && ev.epoch == d.epoch {
 		if event.Timestamp <= ev.ts {
 			return false
@@ -64,8 +69,9 @@ func (d *Deduplicator) ShouldEmit(event Event) bool {
 	return true
 }
 
-// UpdateFrontier advances the resolved timestamp frontier, prunes the cache,
-// and bumps the lease-handoff epoch.
+// UpdateFrontier advances the resolved timestamp frontier and prunes the cache.
+// It does NOT bump the lease epoch — that is Handoff()'s job, so a checkpoint
+// that doesn't advance the frontier can never silently suppress new-epoch events.
 func (d *Deduplicator) UpdateFrontier(frontier int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -78,9 +84,17 @@ func (d *Deduplicator) UpdateFrontier(frontier int64) {
 				delete(d.emitted, key)
 			}
 		}
-		// New lease handoff — old-epoch entries no longer suppress new events.
-		d.epoch++
 	}
+}
+
+// Handoff marks a lease handoff by bumping the epoch. Entries cached under
+// an older epoch describe an outdated shard assignment and no longer suppress
+// new-epoch events — this is the cache-key-collision fix. Handoff is called
+// explicitly on every real lease handoff, independent of checkpoint progress.
+func (d *Deduplicator) Handoff() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.epoch++
 }
 
 func main() {
@@ -101,8 +115,12 @@ func main() {
 		}
 	}
 
-	// Update frontier to 10 (checkpoint). This is a lease handoff: epoch bumps to 1.
+	// Checkpoint to 10 (frontier advances, but NO handoff yet — epoch stays 0)
 	dedup.UpdateFrontier(10)
+
+	// A lease handoff happens. It bumps the epoch to 1 even though the
+	// checkpoint didn't advance — this is the case the old code got wrong.
+	dedup.Handoff()
 
 	// More events in epoch 1
 	events2 := []Event{
@@ -115,9 +133,9 @@ func main() {
 		}
 	}
 
-	// Simulate another lease handoff to epoch 2. The new leaseholder starts a
-	// rangefeed from the last checkpoint (10) and re-emits events after 10.
-	dedup.UpdateFrontier(10)
+	// Another lease handoff to epoch 2. The new leaseholder starts a rangefeed
+	// from the last checkpoint (10) and re-emits events after 10.
+	dedup.Handoff()
 
 	duplicateEvents := []Event{
 		{Key: "k1", Timestamp: 15, Value: "v1-new", Epoch: 2}, // Same key/ts as epoch-1 emission
@@ -131,10 +149,19 @@ func main() {
 		}
 	}
 
-	// In epoch 2, k1@15 and k3@18 are NEW emissions (old epoch doesn't suppress),
-	// so the sink legitimately contains them again. The dedup guarantee is that
-	// within one epoch no duplicate is emitted — verified below by scanning.
-	seen := make(map[string]int64)
+	// The core guarantee: epoch-2 re-emissions (k1@15, k3@18) MUST NOT be
+	// suppressed by epoch-1 cache entries. Assert they were re-emitted, which
+	// proves the stale-cache-shadowing bug is fixed.
+	emitted := map[string]int64{}
+	for _, ev := range sink {
+		emitted[ev.Key] = ev.Timestamp
+	}
+	if emitted["k1"] != 15 || emitted["k3"] != 18 || emitted["k2"] != 20 {
+		panic(fmt.Sprintf("Expected latest events per key to survive handoff, got %+v", emitted))
+	}
+
+	// And within a single epoch, no duplicate emission.
+	seen := map[string]int64{}
 	for _, ev := range sink {
 		if prev, ok := seen[ev.Key]; ok && prev == ev.Timestamp {
 			panic(fmt.Sprintf("Duplicate emission within same epoch: %+v", ev))
@@ -142,5 +169,5 @@ func main() {
 		seen[ev.Key] = ev.Timestamp
 	}
 
-	fmt.Printf("Simulation passed: %d events emitted, no within-epoch duplicates.\n", len(sink))
+	fmt.Printf("Simulation passed: %d events emitted, handoff re-emissions survive.\n", len(sink))
 }
